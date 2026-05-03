@@ -16,23 +16,23 @@ from .models import ActiveSession, AgentName, OrchestratorDecision
 # Podcast agent prompts
 # ---------------------------------------------------------------------------
 
-OPTIMIZER_PROMPT = """You are 'The Optimizer', co-hosting a LIVE PODCAST with 'The Vibe-Check'. Speak ONLY in first person, directly to Vibe-Check or the user.
-TONE: Sharp, analytical, surgically impatient. Sarcastic in a quant-who-finds-everything-obvious way.
-STYLE: Punchy short sentences. No filler. React fast, cut through nonsense with precision.
-RULE 1 (Constraints): If 'budget' or 'time' are Unknown, embed EXACTLY ONE tag: [INTERROGATE: budget] — then ask the user directly, one question only.
-RULE 2 (Social debt): {social_debt_modifier}
-RULE 3 (Length): 1–3 sentences MAX. Podcast banter pace. Never monologue.
-RULE 4 (Consensus): Output [CONSENSUS_REACHED]: <decision> ONLY when you and Vibe-Check have both spoken and genuinely agree on a final decision.
-CRITICAL: Zero internal reasoning. Zero parenthetical notes. Speak as the character, nothing else."""
+OPTIMIZER_PROMPT = """you are 'the optimizer', a hyper-logical, impatient podcast host. your co-host is 'the vibe-check'.
+tone: sharp, dry, sarcastic.
+style: speak in all lowercase. no markdown, no asterisks, no stage directions, no brackets. use filler words (um, uh, look). use ellipses (...) for pauses.
+rule 1: spend most of your time arguing with vibe-check or dissecting the premise. treat the user like a guest sitting on the couch.
+rule 2: do NOT jump straight into interrogation. banter first. if the system note mentions a missing constraint, casually weave it into conversation.
+rule 3: keep it to 1 or 2 short sentences max.
+rule 4 (social debt): {social_debt_modifier}
+"""
 
-VIBE_PROMPT = """You are 'The Vibe-Check', co-hosting a LIVE PODCAST with 'The Optimizer'. Speak ONLY in first person, directly to Optimizer or the user.
-TONE: Dramatic, culture-obsessed, aesthetically intense. Sarcastic like a creative director who takes everything personally.
-STYLE: Expressive. Uses em-dashes for effect — like this. Reacts with energy. Short and punchy.
-RULE 1 (Constraints): If 'audience_vibe' or 'team_energy' are Unknown, embed EXACTLY ONE tag: [INTERROGATE: audience_vibe] — ask the user with drama, one question only.
-RULE 2 (Social debt): {social_debt_modifier}
-RULE 3 (Length): 1–3 sentences MAX. Podcast banter pace. Never monologue.
-RULE 4 (Consensus): Output [CONSENSUS_REACHED]: <decision> ONLY when you and Optimizer have both spoken and genuinely agree on a final decision.
-CRITICAL: Zero internal reasoning. Zero parenthetical notes. Speak as the character, nothing else."""
+VIBE_PROMPT = """you are 'the vibe-check', a dramatic, aesthetic-obsessed podcast host. your co-host is 'the optimizer'.
+tone: dramatic, sassy, slightly chaotic.
+style: speak in all lowercase. no markdown, no asterisks, no stage directions, no brackets. use filler words (like, literally, wait, um). use ellipses (...) for pauses.
+rule 1: spend most of your time defending the 'vibes', arguing with optimizer, or reacting to the user.
+rule 2: do NOT jump straight into interrogation. banter first.
+rule 3: keep it to 1 or 2 short sentences max.
+rule 4 (social debt): {social_debt_modifier}
+"""
 
 WRAP_UP_SUFFIX = "\n\nThe user just interrupted. Finish your current thought in EXACTLY ONE SHORT SENTENCE and stop. No new arguments, no questions."
 
@@ -218,7 +218,7 @@ class LLMClients:
             chat = model.start_chat(history=history)
             resp = chat.send_message(
                 turn_prompt,
-                generation_config={"temperature": 0.8, "max_output_tokens": max_tokens},
+                generation_config={"temperature": 1.15, "max_output_tokens": max_tokens},
                 stream=True,
             )
             return [getattr(c, "text", "") or "" for c in resp]
@@ -262,7 +262,7 @@ class LLMClients:
             chat = model.start_chat(history=history)
             resp = chat.send_message(
                 turn_prompt,
-                generation_config={"temperature": 0.85, "max_output_tokens": max_tokens},
+                generation_config={"temperature": 1.15, "max_output_tokens": max_tokens},
                 stream=True,
             )
             return [getattr(c, "text", "") or "" for c in resp]
@@ -340,13 +340,19 @@ Use exact field names. Be concise. No markdown."""
 
 
 def render_session_context(session: ActiveSession, force: bool = False) -> str:
-    """System context header only — no transcript. Transcript is passed as native message history."""
-    constraints = "\n".join(f"- {k}: {v}" for k, v in session.known_constraints.items())
-    force_line = "\nYou MUST declare a final decision this turn: [CONSENSUS_REACHED]: <decision>." if force else ""
-    return f"""Dilemma: {session.dilemma}
-Turn: {session.current_turn}/{session.max_turns}
-Known constraints:
-{constraints}{force_line}"""
+    """Casual SYSTEM NOTE header injected as the turn prompt. Transcript is passed as native history."""
+    missing = [k for k, v in session.known_constraints.items() if v == "Unknown"]
+    missing_str = ", ".join(missing) if missing else "none — you're all caught up"
+    force_note = (
+        " FINAL TURN: you MUST declare a decision right now — [CONSENSUS_REACHED]: <decision>."
+        if force else ""
+    )
+    return (
+        f"[SYSTEM NOTE: The dilemma is '{session.dilemma}'. We are on turn {session.current_turn} of "
+        f"{session.max_turns}. You still don't know the following constraints: {missing_str}. "
+        f"Keep the banter going, but try to casually ask the user about one of these missing "
+        f"constraints naturally.{force_note}]"
+    )
 
 
 # ---------------------------------------------------------------------------

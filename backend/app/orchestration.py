@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
@@ -17,12 +18,20 @@ _SPEAKER_MAP: dict[str, AgentName] = {
     "vibe_check": "Vibe-Check",
 }
 
+_IDLE_NUDGES = [
+    "uh... hello? you still there?",
+    "i mean... we're waiting.",
+    "like, no pressure, but... we kind of need an answer here.",
+    "um, did we lose you?",
+]
+
 
 class SessionManager:
     def __init__(self, llm: LLMClients):
         self.llm = llm
         self.sessions: dict[str, ActiveSession] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        self.idle_tasks: dict[str, asyncio.Task] = {}
         self.pending_fields: dict[str, list[str]] = {}
         self.lock = asyncio.Lock()
 
@@ -41,9 +50,16 @@ class SessionManager:
     def get(self, session_id: str) -> ActiveSession | None:
         return self.sessions.get(session_id)
 
-    async def start_loop(self, session_id: str, emit: EmitFn) -> None:
+    async def start_loop(
+        self,
+        session_id: str,
+        emit: EmitFn,
+        first_agent: AgentName | None = None,
+    ) -> None:
         await self.cancel_loop(session_id)
-        task = asyncio.create_task(self._conversation_loop(session_id, emit))
+        task = asyncio.create_task(
+            self._conversation_loop(session_id, emit, first_agent=first_agent)
+        )
         self.tasks[session_id] = task
 
     async def cancel_loop(self, session_id: str) -> None:
@@ -54,6 +70,36 @@ class SessionManager:
                 await task
             except asyncio.CancelledError:
                 pass
+
+    # ------------------------------------------------------------------
+    # Idle nudge helpers
+    # ------------------------------------------------------------------
+
+    def _start_idle_nudge(self, session_id: str, emit: EmitFn) -> None:
+        """Cancel any existing idle timer and start a fresh 12s nudge loop."""
+        self._cancel_idle(session_id)
+        self.idle_tasks[session_id] = asyncio.create_task(
+            self._idle_nudge_loop(session_id, emit)
+        )
+
+    def _cancel_idle(self, session_id: str) -> None:
+        task = self.idle_tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _idle_nudge_loop(self, session_id: str, emit: EmitFn) -> None:
+        """Every 12s of user silence, inject a short nudge from the last speaker."""
+        while True:
+            await asyncio.sleep(12)
+            session = self.sessions.get(session_id)
+            if not session or session.status != "awaiting_user_answer":
+                return
+            agent: AgentName = session.last_speaker or random.choice(["Optimizer", "Vibe-Check"])
+            nudge = random.choice(_IDLE_NUDGES)
+            session.transcript.append(TranscriptMessage(speaker=agent, text=nudge))
+            await emit("message_chunk", {"speaker": agent, "chunk": nudge}, session_id)
+            await emit("sentence_audio_ready", {"speaker": agent, "text": nudge}, session_id)
+            await emit("room_state_update", session.model_dump(mode="json"), session_id)
 
     # ------------------------------------------------------------------
     # Public interjection handler
@@ -114,6 +160,9 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def _process_interjection(self, session_id: str, text: str, emit: EmitFn) -> None:
+        # User replied — cancel any idle nudge timer
+        self._cancel_idle(session_id)
+
         session = self.sessions[session_id]
         session.transcript.append(TranscriptMessage(speaker="User", text=text))
         session.pending_question = False
@@ -142,18 +191,6 @@ class SessionManager:
     # Main conversation loop – Orchestrator drives every transition
     # ------------------------------------------------------------------
 
-    async def start_loop(
-        self,
-        session_id: str,
-        emit: EmitFn,
-        first_agent: AgentName | None = None,
-    ) -> None:
-        await self.cancel_loop(session_id)
-        task = asyncio.create_task(
-            self._conversation_loop(session_id, emit, first_agent=first_agent)
-        )
-        self.tasks[session_id] = task
-
     async def _conversation_loop(
         self,
         session_id: str,
@@ -162,10 +199,12 @@ class SessionManager:
     ) -> None:
         session = self.sessions[session_id]
 
-        # Pick the starting agent
+        # Pick the starting agent — randomise on fresh sessions
         if first_agent:
             next_agent: AgentName = first_agent
-        elif session.last_speaker is None or session.last_speaker == "Vibe-Check":
+        elif session.last_speaker is None:
+            next_agent = random.choice(["Optimizer", "Vibe-Check"])
+        elif session.last_speaker == "Vibe-Check":
             next_agent = "Optimizer"
         else:
             next_agent = "Vibe-Check"
@@ -196,7 +235,7 @@ class SessionManager:
             if full_text.strip():
                 session.transcript.append(TranscriptMessage(speaker=agent, text=full_text))
 
-            # Detect if the agent introduced a new question (for pending_question tracking)
+            # Detect if the agent introduced a new question
             if "?" in full_text and not reaction_only:
                 session.pending_question = True
                 session.pending_question_asker = agent
@@ -204,13 +243,15 @@ class SessionManager:
                 if missing:
                     self.pending_fields[session_id] = missing
 
-            # --- Orchestrator decides next state ---
+            # --- Fire Orchestrator concurrently — overlaps with emit/state work ---
+            orchestrator_task = asyncio.create_task(self.llm.orchestrate(session))
+
+            # Apply any constraints the Orchestrator extracted
             try:
-                decision = await self.llm.orchestrate(session)
+                decision = await orchestrator_task
             except Exception:
                 decision = fallback_decision(session)
 
-            # Apply any constraints the Orchestrator extracted
             _apply_constraints(session, decision)
 
             # --- State transitions based on Orchestrator ---
@@ -224,6 +265,8 @@ class SessionManager:
                 missing = [k for k, v in session.known_constraints.items() if v == "Unknown"]
                 await emit("interrogation_triggered", {"missing_fields": missing}, session_id)
                 await emit("room_state_update", session.model_dump(mode="json"), session_id)
+                # Start 12s idle nudge timer
+                self._start_idle_nudge(session_id, emit)
                 return
 
             # Map Orchestrator's decision to the next agent
@@ -235,7 +278,7 @@ class SessionManager:
             session.pending_question = decision.next_speaker == "user"
 
             await emit("room_state_update", session.model_dump(mode="json"), session_id)
-            await asyncio.sleep(0.4)  # natural conversational pause
+            # No explicit sleep — Orchestrator API latency already provides natural turn pacing
 
         # Failsafe: max turns hit without consensus
         if session.status == "speaking":
@@ -254,13 +297,20 @@ class SessionManager:
         force: bool = False,
         reaction_only: bool = False,
     ) -> tuple[str, bool]:
-        """Stream one agent turn. Returns (full_text, was_aborted)."""
+        """Stream one agent turn. Returns (full_text, was_aborted).
+
+        Maintains a sentence buffer: flushes via sentence_audio_ready whenever
+        a sentence-ending character (.?!\n) appears in the incoming chunk.
+        """
         session = self.sessions[session_id]
         full_text = ""
+        sentence_buf = ""
         try:
             stream = self.llm.stream_agent(agent, session, force=force, reaction_only=reaction_only)
             while True:
                 if session.status == "user_interrupting":
+                    if sentence_buf.strip():
+                        await emit("sentence_audio_ready", {"speaker": agent, "text": sentence_buf.strip()}, session_id)
                     return full_text, True
                 try:
                     chunk = await asyncio.wait_for(stream.__anext__(), timeout=45)
@@ -271,6 +321,11 @@ class SessionManager:
                 full_text += chunk
                 if chunk:
                     await emit("message_chunk", {"speaker": agent, "chunk": chunk}, session_id)
+                    sentence_buf += chunk
+                    if any(c in chunk for c in ".?!\n"):
+                        if sentence_buf.strip():
+                            await emit("sentence_audio_ready", {"speaker": agent, "text": sentence_buf.strip()}, session_id)
+                        sentence_buf = ""
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -279,6 +334,10 @@ class SessionManager:
             await emit("message_chunk", {"speaker": "System", "chunk": error_text}, session_id)
             await emit("room_state_update", session.model_dump(mode="json"), session_id)
             return full_text, True  # treat as aborted so loop exits cleanly
+
+        # Flush any trailing text that didn't end with punctuation
+        if sentence_buf.strip():
+            await emit("sentence_audio_ready", {"speaker": agent, "text": sentence_buf.strip()}, session_id)
 
         return full_text, False
 
@@ -293,6 +352,7 @@ class SessionManager:
         last_agent: AgentName,
         emit: EmitFn,
     ) -> None:
+        self._cancel_idle(session_id)
         session = self.sessions[session_id]
 
         # Prefer the Orchestrator's explicit decision text; fall back to regex scan
@@ -324,6 +384,7 @@ class SessionManager:
 
     async def _force_consensus(self, session_id: str, emit: EmitFn) -> None:
         """Failsafe: max turns hit. Force the last agent to declare a decision."""
+        self._cancel_idle(session_id)
         session = self.sessions[session_id]
         agent: AgentName = "Optimizer" if session.last_speaker == "Vibe-Check" else "Vibe-Check"
         session.last_speaker = agent
